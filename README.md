@@ -8,7 +8,9 @@ Instagram, TikTok, X/Twitter, Facebook, Reddit, Vimeo and about 1000 other sites
   each with an estimated file size. Tap one and you get the file.
 - Send a **YouTube playlist** link to download all of it: pick MP3, 360p, 480p or 720p and the
   videos come **one by one**, each as its own file. If one is over 50 MB, the bot tries a lower
-  quality automatically. Send `/stop` to stop. (A link to a video inside a playlist also offers
+  quality automatically. Send `/stop` to stop.
+  Tap **☑️ Choose videos** to tick only the ones you want (8 per page), or type numbers like
+  `1-5, 8, 12`, then pick the format. (A link to a video inside a playlist also offers
   "Only this video".)
 - Send `/id` and you get your Telegram ID.
 

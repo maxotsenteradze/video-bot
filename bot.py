@@ -152,7 +152,7 @@ def probe_playlist(url: str) -> dict | None:
         if link and not link.startswith("http") and e.get("id"):
             link = f"https://www.youtube.com/watch?v={e['id']}"
         if link and (e.get("title") or "") not in ("[Private video]", "[Deleted video]"):
-            entries.append({"url": link, "title": e.get("title") or "video"})
+            entries.append({"url": link, "title": e.get("title") or "video", "no": len(entries) + 1})
     if not entries:
         return None
     return {"title": info.get("title") or "Playlist", "entries": entries}
@@ -251,6 +251,8 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     m = URL_RE.search(msg.text or "")
     if not m:
+        if await maybe_select_numbers(update, context):
+            return
         await msg.reply_text("Send me a link that starts with http:// or https://")
         return
     url = m.group(0)
@@ -269,26 +271,8 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.bot_data.setdefault("links", {})[key] = {
                 "url": url, "title": pl["title"], "playlist": pl
             }
-            n = len(pl["entries"])
-            rows = []
-            if "v=" in url or "youtu.be/" in url:
-                rows.append([InlineKeyboardButton("▶️ Only this video", callback_data=f"one|{key}")])
-            rows.append([InlineKeyboardButton(f"🎵 All {n} as MP3", callback_data=f"pl|{key}|mp3")])
-            rows.append([
-                InlineKeyboardButton(f"🎬 All 360p", callback_data=f"pl|{key}|360"),
-                InlineKeyboardButton(f"🎬 All 480p", callback_data=f"pl|{key}|480"),
-            ])
-            rows.append([
-                InlineKeyboardButton(f"🎬 All 720p", callback_data=f"pl|{key}|720"),
-                InlineKeyboardButton("✖️ Cancel", callback_data=f"dl|{key}|cancel"),
-            ])
-            await status.edit_text(
-                f"📃 Playlist: {pl['title'][:150]}\n{n} videos\n\n"
-                "They will come one by one, each as its own file. "
-                "If a video is too big for 50 MB, I'll try a lower quality automatically.\n"
-                "Send /stop to stop.",
-                reply_markup=InlineKeyboardMarkup(rows),
-            )
+            text, markup = playlist_menu(key, context.bot_data["links"][key])
+            await status.edit_text(text, reply_markup=markup)
             return
 
     await show_single(status, context, url)
@@ -389,7 +373,8 @@ async def run_playlist(context: ContextTypes.DEFAULT_TYPE, chat_id: int, status,
                         if path.stat().st_size > MAX_BYTES:
                             last_err = f"too big ({path.stat().st_size / 1024 / 1024:.0f} MB)"
                             continue  # try the next lower quality
-                        caption = f"{i}/{n} · {e['title'][:900]}" + ("" if step == "mp3" else f" · {step}p")
+                        num = f"#{e['no']} " if e.get("no", i) != i else ""
+                        caption = f"{i}/{n} · {num}{e['title'][:900]}" + ("" if step == "mp3" else f" · {step}p")
                         try:
                             with path.open("rb") as f:
                                 if step == "mp3":
@@ -439,10 +424,190 @@ async def on_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not item:
         await q.edit_message_text("⌛ This link expired. Please send it again.")
         return
+    pl = item["playlist"]
+    if item.get("use_sel"):
+        chosen = [e for e in pl["entries"] if e["no"] in item["sel"]]
+        if not chosen:
+            await q.edit_message_text("Nothing selected. Send the link again.")
+            return
+        pl = {"title": pl["title"], "entries": chosen}
+    context.user_data.pop("selecting", None)
     jobs[chat_id] = {"stop": False}
-    await q.edit_message_text(f"📃 Starting playlist ({len(item['playlist']['entries'])} videos)…")
+    await q.edit_message_text(f"📃 Starting playlist ({len(pl['entries'])} videos)…")
     # Run in the background so /stop and other messages still work.
-    context.application.create_task(run_playlist(context, chat_id, q.message, item["playlist"], choice))
+    context.application.create_task(run_playlist(context, chat_id, q.message, pl, choice))
+
+
+# ---------- choosing videos from a playlist ----------
+
+PAGE = 8
+
+
+def playlist_menu(key: str, item: dict):
+    pl = item["playlist"]
+    n = len(pl["entries"])
+    rows = []
+    if "v=" in item["url"] or "youtu.be/" in item["url"]:
+        rows.append([InlineKeyboardButton("▶️ Only this video", callback_data=f"one|{key}")])
+    rows.append([InlineKeyboardButton("☑️ Choose videos", callback_data=f"sel|{key}|0")])
+    rows.append([InlineKeyboardButton(f"🎵 All {n} as MP3", callback_data=f"pl|{key}|mp3")])
+    rows.append([
+        InlineKeyboardButton("🎬 All 360p", callback_data=f"pl|{key}|360"),
+        InlineKeyboardButton("🎬 All 480p", callback_data=f"pl|{key}|480"),
+    ])
+    rows.append([
+        InlineKeyboardButton("🎬 All 720p", callback_data=f"pl|{key}|720"),
+        InlineKeyboardButton("✖️ Cancel", callback_data=f"dl|{key}|cancel"),
+    ])
+    text = (
+        f"📃 Playlist: {pl['title'][:150]}\n{n} videos\n\n"
+        "Download all, or tap ☑️ Choose videos to pick some.\n"
+        "Videos come one by one. If one is over 50 MB, I'll try a lower quality.\n"
+        "Send /stop to stop."
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+def selection_view(key: str, item: dict, page: int):
+    entries = item["playlist"]["entries"]
+    sel = item.setdefault("sel", set())
+    pages = max(1, (len(entries) + PAGE - 1) // PAGE)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for e in entries[page * PAGE:(page + 1) * PAGE]:
+        mark = "✅" if e["no"] in sel else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} {e['no']}. {e['title'][:45]}",
+                                          callback_data=f"tg|{key}|{e['no']}|{page}")])
+    if pages > 1:
+        rows.append([
+            InlineKeyboardButton("◀️", callback_data=f"sel|{key}|{page - 1}"),
+            InlineKeyboardButton(f"Page {page + 1}/{pages}", callback_data=f"sel|{key}|{page}"),
+            InlineKeyboardButton("▶️", callback_data=f"sel|{key}|{page + 1}"),
+        ])
+    rows.append([
+        InlineKeyboardButton("All", callback_data=f"sa|{key}|{page}"),
+        InlineKeyboardButton("None", callback_data=f"sn|{key}|{page}"),
+        InlineKeyboardButton("⬅️ Back", callback_data=f"bk|{key}"),
+    ])
+    rows.append([InlineKeyboardButton(f"➡️ Next: choose format ({len(sel)} selected)",
+                                      callback_data=f"sd|{key}")])
+    text = (
+        f"☑️ {item['playlist']['title'][:100]}\n"
+        f"Selected: {len(sel)} of {len(entries)}\n\n"
+        "Tap videos to tick them, or type numbers here, like:  1-5, 8, 12"
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+def format_menu_for_selection(key: str, item: dict):
+    k = len(item["sel"])
+    rows = [
+        [InlineKeyboardButton(f"🎵 {k} as MP3", callback_data=f"pl|{key}|mp3")],
+        [InlineKeyboardButton("🎬 360p", callback_data=f"pl|{key}|360"),
+         InlineKeyboardButton("🎬 480p", callback_data=f"pl|{key}|480"),
+         InlineKeyboardButton("🎬 720p", callback_data=f"pl|{key}|720")],
+        [InlineKeyboardButton("⬅️ Change selection", callback_data=f"sel|{key}|0"),
+         InlineKeyboardButton("✖️ Cancel", callback_data=f"dl|{key}|cancel")],
+    ]
+    nums = ", ".join(str(x) for x in sorted(item["sel"]))
+    return f"✅ {k} videos selected: {nums[:500]}\n\nChoose format:", InlineKeyboardMarkup(rows)
+
+
+async def on_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not allowed(update):
+        await q.answer("Not allowed", show_alert=True)
+        return
+    parts = q.data.split("|")
+    action, key = parts[0], parts[1]
+    item = context.bot_data.get("links", {}).get(key)
+    if not item or "playlist" not in item:
+        await q.answer()
+        await q.edit_message_text("⌛ This link expired. Please send it again.")
+        return
+    sel = item.setdefault("sel", set())
+    page = 0
+
+    if action == "bk":
+        item["use_sel"] = False
+        context.user_data.pop("selecting", None)
+        text, markup = playlist_menu(key, item)
+        await q.answer()
+        await q.edit_message_text(text, reply_markup=markup)
+        return
+    if action == "sd":
+        if not sel:
+            await q.answer("Tick at least one video first.", show_alert=True)
+            return
+        item["use_sel"] = True
+        text, markup = format_menu_for_selection(key, item)
+        await q.answer()
+        await q.edit_message_text(text, reply_markup=markup)
+        return
+    if action == "tg":
+        no, page = int(parts[2]), int(parts[3])
+        sel.symmetric_difference_update({no})
+    elif action == "sa":
+        page = int(parts[2])
+        sel.update(e["no"] for e in item["playlist"]["entries"])
+    elif action == "sn":
+        page = int(parts[2])
+        sel.clear()
+    else:  # "sel": open / change page
+        page = int(parts[2])
+
+    item["use_sel"] = False
+    item["page"] = page
+    context.user_data["selecting"] = {"key": key, "chat_id": q.message.chat_id,
+                                      "message_id": q.message.message_id}
+    text, markup = selection_view(key, item, page)
+    await q.answer()
+    try:
+        await q.edit_message_text(text, reply_markup=markup)
+    except Exception:
+        pass  # "message is not modified" (e.g. pressed the page label)
+
+
+def parse_numbers(text: str, maximum: int) -> set[int] | None:
+    """'1-5, 8 12' -> {1,2,3,4,5,8,12}. None if the text isn't a list of numbers."""
+    if not re.fullmatch(r"[\d\s,;\-–]+", text.strip()):
+        return None
+    result = set()
+    for a, b in re.findall(r"(\d+)\s*(?:[-–]\s*(\d+))?", text):
+        lo = int(a)
+        hi = int(b) if b else lo
+        if lo > hi:
+            lo, hi = hi, lo
+        result.update(x for x in range(lo, hi + 1) if 1 <= x <= maximum)
+    return result
+
+
+async def maybe_select_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    state = context.user_data.get("selecting")
+    if not state:
+        return False
+    item = context.bot_data.get("links", {}).get(state["key"])
+    if not item or "playlist" not in item:
+        return False
+    nums = parse_numbers(update.message.text or "", len(item["playlist"]["entries"]))
+    if nums is None:
+        return False
+    if not nums:
+        await update.message.reply_text("Those numbers aren't in the playlist.")
+        return True
+    item["sel"] = nums
+    item["use_sel"] = False
+    text, markup = selection_view(state["key"], item, item.get("page", 0))
+    try:
+        await context.bot.edit_message_text(text, chat_id=state["chat_id"],
+                                            message_id=state["message_id"], reply_markup=markup)
+    except Exception:
+        pass
+    await update.message.reply_text(
+        f"✅ Selected {len(nums)}: {', '.join(map(str, sorted(nums)))[:300]}\n"
+        "Tap ➡️ Next in the list above to choose the format."
+    )
+    return True
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -556,6 +721,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(on_one, pattern=r"^one\|"))
     app.add_handler(CallbackQueryHandler(on_playlist, pattern=r"^pl\|"))
+    app.add_handler(CallbackQueryHandler(on_select, pattern=r"^(sel|tg|sa|sn|sd|bk)\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_link))
 
     if WEBHOOK_URL:
