@@ -136,6 +136,45 @@ BEST_FIT = (
 )
 
 
+def probe_playlist(url: str) -> dict | None:
+    """Fast list of playlist entries (no per-video requests). None if not a playlist."""
+    opts = base_opts()
+    opts.update({"noplaylist": False, "extract_flat": "in_playlist"})
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if info.get("_type") != "playlist":
+        return None
+    entries = []
+    for e in info.get("entries") or []:
+        if not e:
+            continue
+        link = e.get("url") or e.get("webpage_url")
+        if link and not link.startswith("http") and e.get("id"):
+            link = f"https://www.youtube.com/watch?v={e['id']}"
+        if link and (e.get("title") or "") not in ("[Private video]", "[Deleted video]"):
+            entries.append({"url": link, "title": e.get("title") or "video"})
+    if not entries:
+        return None
+    return {"title": info.get("title") or "Playlist", "entries": entries}
+
+
+def download_quality(url: str, folder: str, height: int) -> Path:
+    """Best video up to `height` (short side, so vertical videos work too)."""
+    opts = base_opts()
+    opts.update({
+        "outtmpl": os.path.join(folder, "%(title).80s.%(ext)s"),
+        "format": "bv*+ba/b",
+        "format_sort": [f"res:{height}", "ext:mp4:m4a"],
+        "merge_output_format": "mp4",
+    })
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.extract_info(url, download=True)
+    files = [p for p in Path(folder).iterdir() if p.is_file() and not p.name.endswith(".part")]
+    if not files:
+        raise RuntimeError("Nothing was downloaded.")
+    return max(files, key=lambda p: p.stat().st_size)
+
+
 def download(url: str, folder: str, choice: str, fmt: str | None = None) -> Path:
     opts = base_opts()
     opts["outtmpl"] = os.path.join(folder, "%(title).80s.%(ext)s")
@@ -195,6 +234,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Send me a video link and choose the format:\n"
         "🎵 MP3 · 🎬 360p · 480p · 720p · 1080p\n\n"
+        "YouTube playlist links work too: videos come one by one. /stop stops it.\n\n"
         f"Limit: {LIMIT_MB} MB per file (Telegram rule for bots). "
         "Options marked ⚠️ are probably too big."
     )
@@ -216,6 +256,45 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     url = m.group(0)
 
     status = await msg.reply_text("🔎 Checking the link…")
+
+    # Playlist? (YouTube links with list=, or playlist pages)
+    if "list=" in url or "/playlist" in url:
+        try:
+            pl = await asyncio.to_thread(probe_playlist, url)
+        except Exception as e:
+            log.info("Playlist probe failed, treating as single video: %s", e)
+            pl = None
+        if pl and len(pl["entries"]) > 1:
+            key = uuid.uuid4().hex[:10]
+            context.bot_data.setdefault("links", {})[key] = {
+                "url": url, "title": pl["title"], "playlist": pl
+            }
+            n = len(pl["entries"])
+            rows = []
+            if "v=" in url or "youtu.be/" in url:
+                rows.append([InlineKeyboardButton("▶️ Only this video", callback_data=f"one|{key}")])
+            rows.append([InlineKeyboardButton(f"🎵 All {n} as MP3", callback_data=f"pl|{key}|mp3")])
+            rows.append([
+                InlineKeyboardButton(f"🎬 All 360p", callback_data=f"pl|{key}|360"),
+                InlineKeyboardButton(f"🎬 All 480p", callback_data=f"pl|{key}|480"),
+            ])
+            rows.append([
+                InlineKeyboardButton(f"🎬 All 720p", callback_data=f"pl|{key}|720"),
+                InlineKeyboardButton("✖️ Cancel", callback_data=f"dl|{key}|cancel"),
+            ])
+            await status.edit_text(
+                f"📃 Playlist: {pl['title'][:150]}\n{n} videos\n\n"
+                "They will come one by one, each as its own file. "
+                "If a video is too big for 50 MB, I'll try a lower quality automatically.\n"
+                "Send /stop to stop.",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+
+    await show_single(status, context, url)
+
+
+async def show_single(status, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
     try:
         info = await asyncio.to_thread(probe, url)
     except Exception as e:
@@ -231,6 +310,150 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     dur = fmt_duration(info["duration"])
     text = f"🎞 {info['title'][:200]}" + (f"\n⏱ {dur}" if dur else "") + "\n\nChoose format:"
     await status.edit_text(text, reply_markup=build_keyboard(key, info))
+
+
+async def on_one(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """'Only this video' pressed on a playlist link."""
+    q = update.callback_query
+    if not allowed(update):
+        await q.answer("Not allowed", show_alert=True)
+        return
+    await q.answer()
+    key = q.data.split("|", 1)[1]
+    item = context.bot_data.get("links", {}).pop(key, None)
+    if not item:
+        await q.edit_message_text("⌛ This link expired. Please send it again.")
+        return
+    await q.edit_message_text("🔎 Checking the video…")
+    await show_single(q.message, context, item["url"])
+
+
+# ---------- playlists ----------
+
+QUALITY_STEPS = [720, 480, 360, 240, 144]
+
+
+async def keep_awake(stop: asyncio.Event) -> None:
+    """Render's free plan sleeps after 15 min with no incoming requests.
+    While a playlist is running, ping our own URL so the server stays up."""
+    if not WEBHOOK_URL:
+        return
+    import httpx
+    async with httpx.AsyncClient(timeout=20) as client:
+        while not stop.is_set():
+            try:
+                await client.get(WEBHOOK_URL)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=240)
+            except asyncio.TimeoutError:
+                pass
+
+
+async def run_playlist(context: ContextTypes.DEFAULT_TYPE, chat_id: int, status, pl: dict, choice: str) -> None:
+    jobs = context.bot_data.setdefault("jobs", {})
+    job = jobs[chat_id]
+    entries = pl["entries"]
+    n = len(entries)
+    sent, skipped = 0, []
+    awake = asyncio.Event()
+    pinger = asyncio.create_task(keep_awake(awake))
+    try:
+        for i, e in enumerate(entries, 1):
+            if job["stop"]:
+                break
+            title = e["title"][:120]
+            try:
+                await status.edit_text(f"📃 {pl['title'][:100]}\n⏳ {i}/{n}: {title}\n\nSend /stop to stop.")
+            except Exception:
+                pass
+
+            steps = ["mp3"] if choice == "mp3" else [h for h in QUALITY_STEPS if h <= int(choice)]
+            done = False
+            last_err = ""
+            for step in steps:
+                if job["stop"]:
+                    break
+                async with download_lock:
+                    with tempfile.TemporaryDirectory() as folder:
+                        try:
+                            if step == "mp3":
+                                path = await asyncio.to_thread(download, e["url"], folder, "mp3")
+                            else:
+                                path = await asyncio.to_thread(download_quality, e["url"], folder, step)
+                        except Exception as err:
+                            last_err = str(err)[:120]
+                            log.warning("Playlist item failed %s: %s", e["url"], err)
+                            break  # a download error won't be fixed by lower quality
+                        if path.stat().st_size > MAX_BYTES:
+                            last_err = f"too big ({path.stat().st_size / 1024 / 1024:.0f} MB)"
+                            continue  # try the next lower quality
+                        caption = f"{i}/{n} · {e['title'][:900]}" + ("" if step == "mp3" else f" · {step}p")
+                        try:
+                            with path.open("rb") as f:
+                                if step == "mp3":
+                                    await context.bot.send_audio(chat_id, f, title=e["title"][:64], caption=caption,
+                                                                 read_timeout=300, write_timeout=300)
+                                else:
+                                    await context.bot.send_video(chat_id, f, caption=caption, supports_streaming=True,
+                                                                 read_timeout=300, write_timeout=300)
+                        except Exception as err:
+                            log.warning("Media upload failed, sending as file: %s", err)
+                            with path.open("rb") as f:
+                                await context.bot.send_document(chat_id, f, caption=caption,
+                                                                read_timeout=300, write_timeout=300)
+                        done = True
+                        break
+            if done:
+                sent += 1
+            elif not job["stop"]:
+                skipped.append(f"{i}. {title} ({last_err or 'failed'})")
+    finally:
+        awake.set()
+        pinger.cancel()
+        jobs.pop(chat_id, None)
+
+    summary = f"✅ Playlist finished: {sent}/{n} sent." if not job["stop"] else f"⏹ Stopped. {sent}/{n} sent."
+    if skipped:
+        summary += "\n\nSkipped:\n" + "\n".join(skipped)[:3500]
+    try:
+        await status.edit_text(summary)
+    except Exception:
+        await context.bot.send_message(chat_id, summary)
+
+
+async def on_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not allowed(update):
+        await q.answer("Not allowed", show_alert=True)
+        return
+    _, key, choice = q.data.split("|", 2)
+    chat_id = q.message.chat_id
+    jobs = context.bot_data.setdefault("jobs", {})
+    if chat_id in jobs:
+        await q.answer("A playlist is already running. Send /stop first.", show_alert=True)
+        return
+    await q.answer()
+    item = context.bot_data.get("links", {}).pop(key, None)
+    if not item:
+        await q.edit_message_text("⌛ This link expired. Please send it again.")
+        return
+    jobs[chat_id] = {"stop": False}
+    await q.edit_message_text(f"📃 Starting playlist ({len(item['playlist']['entries'])} videos)…")
+    # Run in the background so /stop and other messages still work.
+    context.application.create_task(run_playlist(context, chat_id, q.message, item["playlist"], choice))
+
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    job = context.bot_data.get("jobs", {}).get(update.effective_chat.id)
+    if job:
+        job["stop"] = True
+        await update.message.reply_text("⏹ Stopping after the current video…")
+    else:
+        await update.message.reply_text("Nothing is running.")
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -329,7 +552,10 @@ def main() -> None:
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("id", myid))
     app.add_handler(CommandHandler("mp3", mp3_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^dl\|"))
+    app.add_handler(CallbackQueryHandler(on_one, pattern=r"^one\|"))
+    app.add_handler(CallbackQueryHandler(on_playlist, pattern=r"^pl\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_link))
 
     if WEBHOOK_URL:

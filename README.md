@@ -6,6 +6,10 @@ Instagram, TikTok, X/Twitter, Facebook, Reddit, Vimeo and about 1000 other sites
 
 - Send a link and the bot shows buttons: **🎵 MP3 · 🎬 360p · 480p · 720p · 1080p · ⭐ Best that fits**,
   each with an estimated file size. Tap one and you get the file.
+- Send a **YouTube playlist** link to download all of it: pick MP3, 360p, 480p or 720p and the
+  videos come **one by one**, each as its own file. If one is over 50 MB, the bot tries a lower
+  quality automatically. Send `/stop` to stop. (A link to a video inside a playlist also offers
+  "Only this video".)
 - Send `/id` and you get your Telegram ID.
 
 Telegram lets bots send files up to **50 MB**. Options marked ⚠️ are probably
