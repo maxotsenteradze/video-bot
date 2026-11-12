@@ -62,8 +62,10 @@ Open your bot in Telegram, press **Start**, and send a link.
   Instagram often needs a login too. To fix that, add cookies:
   1. On your PC, install the browser extension **"Get cookies.txt LOCALLY"**.
   2. Log in to YouTube or Instagram, then export cookies.txt with the extension.
-  3. In Render, add an environment variable named `COOKIES` and paste the
-     **whole contents** of the file as its value.
+  3. In Render, open your service → **Environment** → **Secret Files** → **Add Secret File**.
+     Filename: `cookies.txt`. Contents: paste the **whole** file. Save.
+     (Pasting it into a `COOKIES` environment variable also works.)
+  4. Send `/status` to the bot to check the cookies were loaded.
   Use a spare account for this, not your main one.
 - **Keep yt-dlp up to date.** Sites change often. If downloads start failing, open
   Render and click **Manual Deploy → Clear build cache & deploy**. This installs the

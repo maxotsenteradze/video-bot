@@ -58,10 +58,31 @@ MAX_BYTES = 49 * 1024 * 1024
 URL_RE = re.compile(r"https?://\S+")
 HEIGHTS = [360, 480, 720, 1080]
 
-COOKIE_FILE = None
-if os.environ.get("COOKIES"):
-    COOKIE_FILE = Path(tempfile.gettempdir()) / "cookies.txt"
-    COOKIE_FILE.write_text(os.environ["COOKIES"])
+def load_cookies() -> Path | None:
+    """Cookies from a Render Secret File (cookies.txt) or the COOKIES variable.
+    Copied to /tmp because yt-dlp writes updated cookies back to the file."""
+    text = None
+    for p in (Path("/etc/secrets/cookies.txt"), Path("cookies.txt")):
+        if p.is_file():
+            text = p.read_text(errors="ignore")
+            break
+    if text is None and os.environ.get("COOKIES"):
+        text = os.environ["COOKIES"]
+        if "\n" not in text and "\\n" in text:  # pasted with literal \n
+            text = text.replace("\\n", "\n")
+    if not text or not text.strip():
+        return None
+    if not text.lstrip().startswith("# "):
+        text = "# Netscape HTTP Cookie File\n" + text
+    dest = Path(tempfile.gettempdir()) / "cookies.txt"
+    dest.write_text(text)
+    return dest
+
+
+COOKIE_FILE = load_cookies()
+COOKIE_LINES = 0
+if COOKIE_FILE:
+    COOKIE_LINES = sum(1 for l in COOKIE_FILE.read_text().splitlines() if l.strip() and not l.startswith("#"))
 
 # One download at a time keeps the small free server from running out of RAM.
 download_lock = asyncio.Lock()
@@ -394,6 +415,9 @@ async def run_playlist(context: ContextTypes.DEFAULT_TYPE, chat_id: int, status,
                 sent += 1
             elif not job["stop"]:
                 skipped.append(f"{i}. {title} ({last_err or 'failed'})")
+                if "sign in" in last_err.lower() and len(skipped) >= 2 and sent == 0:
+                    skipped.append("Stopped early: YouTube is blocking the server. Add/refresh cookies (/status).")
+                    break
     finally:
         awake.set()
         pinger.cancel()
@@ -610,6 +634,18 @@ async def maybe_select_numbers(update: Update, context: ContextTypes.DEFAULT_TYP
     return True
 
 
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    if COOKIE_FILE:
+        domains = sorted({l.split("\t")[0].lstrip(".") for l in COOKIE_FILE.read_text().splitlines()
+                          if l.strip() and not l.startswith("#") and "\t" in l})
+        ck = f"✅ Cookies loaded: {COOKIE_LINES} lines\nSites: {', '.join(domains)[:500] or '?'}"
+    else:
+        ck = "❌ No cookies loaded. YouTube may block downloads."
+    await update.message.reply_text(f"{ck}\n\nyt-dlp version: {yt_dlp.version.__version__}")
+
+
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
@@ -718,6 +754,7 @@ def main() -> None:
     app.add_handler(CommandHandler("id", myid))
     app.add_handler(CommandHandler("mp3", mp3_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(on_one, pattern=r"^one\|"))
     app.add_handler(CallbackQueryHandler(on_playlist, pattern=r"^pl\|"))
@@ -726,7 +763,7 @@ def main() -> None:
 
     if WEBHOOK_URL:
         secret_path = BOT_TOKEN.split(":")[-1][:20]
-        log.info("Starting webhook on port %s", PORT)
+        log.info("Starting webhook on port %s (cookies: %s lines)", PORT, COOKIE_LINES)
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
