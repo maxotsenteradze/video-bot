@@ -4,12 +4,12 @@ Send the bot a link and it sends the video back. It works with YouTube,
 Instagram, TikTok, X/Twitter, Facebook, Reddit, Vimeo and about 1000 other sites
 (powered by yt-dlp).
 
-- Send a link and you get the video (MP4).
-- Send `/mp3 <link>` and you get only the audio.
+- Send a link and the bot shows buttons: **🎵 MP3 · 🎬 360p · 480p · 720p · 1080p · ⭐ Best that fits**,
+  each with an estimated file size. Tap one and you get the file.
 - Send `/id` and you get your Telegram ID.
 
-Telegram lets bots send files up to **50 MB**, so the bot automatically picks a
-quality that fits (usually 720p or lower).
+Telegram lets bots send files up to **50 MB**. Options marked ⚠️ are probably
+bigger than that. Pick a lower quality or MP3 instead.
 
 ---
 
