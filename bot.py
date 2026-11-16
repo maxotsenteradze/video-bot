@@ -112,6 +112,10 @@ def to_netscape(text: str) -> str | None:
     else:
         for line in text.splitlines():
             p = line.split("\t")
+            if len(p) < 5:
+                q = line.split()
+                if len(q) == 7 and q[1] in ("TRUE", "FALSE"):
+                    p = q
             if line.startswith("#") or len(p) < 5:
                 continue
             if len(p) >= 7 and p[1] in ("TRUE", "FALSE"):  # already Netscape
@@ -429,6 +433,8 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not allowed(update):
         await msg.reply_text(f"Not allowed. Your ID: {update.effective_user.id}")
+        return
+    if await on_cookie_text(update, context):
         return
     m = URL_RE.search(msg.text or "")
     if not m:
@@ -952,6 +958,37 @@ async def warn_cookies(bot, chat_id: int) -> None:
             log.warning("cookie warning failed: %s", e)
 
 
+def looks_like_cookies(text: str) -> bool:
+    t = text.lstrip()
+    return (t.startswith("# Netscape") or t.startswith("# HTTP Cookie")
+            or (t.startswith("[") and '"name"' in t)
+            or bool(re.search(r"\.(youtube|google)\.com\s+(TRUE|FALSE)\s", t)))
+
+
+async def apply_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str) -> None:
+    import io
+    text = to_netscape(raw_text)
+    if not text:
+        await update.message.reply_text("❌ That doesn't look like cookies (Netscape or JSON).")
+        return
+    names = {l.split("\t")[5] for l in text.splitlines() if l.count("\t") >= 6}
+    n = set_cookies(text, "Telegram")
+    missing = sorted({"SID", "HSID", "SSID", "__Secure-3PSID", "LOGIN_INFO"} - names)
+    msg = f"✅ Cookies updated: {n} lines"
+    if missing:
+        msg += f"\n\n⚠️ Missing important YouTube cookies: {', '.join(missing)}. YouTube will probably still block."
+    # Send the clean file back and pin it, so it's reloaded after restarts.
+    try:
+        sent = await update.message.reply_document(
+            io.BytesIO(text.encode()), filename="cookies.txt", caption=msg)
+        await sent.pin(disable_notification=True)
+        if OWNER_ID and update.effective_chat.id != OWNER_ID:
+            await update.message.reply_text("⚠️ Not the owner chat; after a restart send cookies again.")
+    except Exception as e:
+        log.warning("cookie pin failed: %s", e)
+        await update.message.reply_text(msg + "\n⚠️ Couldn't pin; after a restart send it again.")
+
+
 async def on_cookie_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """User sends a cookies file (or JSON export) as a document."""
     if not allowed(update):
@@ -961,27 +998,22 @@ async def on_cookie_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("File too big for a cookies file.")
         return
     raw = await (await doc.get_file()).download_as_bytearray()
-    text = to_netscape(bytes(raw).decode("utf-8", errors="ignore"))
-    if not text:
-        await update.message.reply_text("❌ That doesn't look like a cookies file (Netscape .txt or JSON).")
-        return
-    names = {l.split("\t")[5] for l in text.splitlines() if l.count("\t") >= 6}
-    n = set_cookies(text, "Telegram")
-    key = {"SID", "HSID", "SSID", "__Secure-3PSID", "LOGIN_INFO"}
-    missing = sorted(key - names)
-    # Pin it so the bot can reload it after a restart.
-    try:
-        await update.message.pin(disable_notification=True)
-        saved = "📌 Pinned — I'll reload it automatically after restarts."
-    except Exception as e:
-        log.warning("pin failed: %s", e)
-        saved = "⚠️ Couldn't pin it; after a restart send it again."
-    if OWNER_ID and update.effective_chat.id != OWNER_ID:
-        saved = "⚠️ Not your owner chat; after a restart send it again."
-    msg = f"✅ Cookies updated: {n} lines\n{saved}"
-    if missing:
-        msg += f"\n\n⚠️ Missing important YouTube cookies: {', '.join(missing)}. YouTube may still block."
-    await update.message.reply_text(msg)
+    await apply_cookies(update, context, bytes(raw).decode("utf-8", errors="ignore"))
+
+
+async def on_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Cookies pasted as text. Long pastes arrive split into several messages,
+    so pieces sent within 30 s are joined."""
+    import time
+    text = update.message.text or ""
+    buf = context.chat_data.get("cookie_buf")
+    recent = buf and time.time() - buf[0] < 30
+    if not looks_like_cookies(text) and not (recent and "\t" in text or recent and re.search(r"\s(TRUE|FALSE)\s", text)):
+        return False
+    joined = (buf[1] + "\n" + text) if recent and not text.lstrip().startswith("# Netscape") else text
+    context.chat_data["cookie_buf"] = (time.time(), joined)
+    await apply_cookies(update, context, joined)
+    return True
 
 
 async def restore_cookies(app) -> None:
