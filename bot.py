@@ -85,7 +85,7 @@ def to_netscape(text: str) -> str | None:
     """Accepts Netscape cookies.txt, a JSON export (Cookie Editor etc.) or a table
     copied from browser DevTools. Returns Netscape text, or None if nothing usable."""
     import json
-    from datetime import datetime
+    from datetime import datetime  # noqa: also used below
     text = text.lstrip("\ufeff").strip()
     rows = []
 
@@ -127,6 +127,18 @@ def to_netscape(text: str) -> str | None:
             except ValueError:
                 ts = 0
             row(dom, path, len(p) > 7 and p[7].strip() == "✓", ts, name, val)
+    # Phone exports give host-only m.youtube.com / www.youtube.com cookies and
+    # session expiry 0; widen them so yt-dlp sends them to every YouTube host.
+    fixed = []
+    for r in rows:
+        f = r.split("\t")
+        for base in ("youtube.com", "google.com"):
+            if f[0] in (base, "m." + base, "www." + base, "accounts." + base):
+                f[0], f[1] = "." + base, "TRUE"
+        if f[4] in ("0", ""):
+            f[4] = str(int(datetime.now().timestamp()) + 180 * 86400)
+        fixed.append("\t".join(f))
+    rows = fixed
     seen, out = set(), []
     for r in rows:
         k = tuple(r.split("\t")[i] for i in (0, 2, 5))
@@ -221,6 +233,10 @@ class _CookieWatch:
 
 
 def base_opts(mode: str | None = None) -> dict:
+    global MODE, WARP
+    if mode is None and not WARP and warp_up():
+        WARP = True
+        MODE = "warp+cookies" if COOKIE_FILE else "warp"
     m = MODES[mode or MODE]
     opts = {"noplaylist": True, "quiet": True, "no_warnings": True, "logger": _CookieWatch()}
     if COOKIE_FILE and m["cookies"]:
