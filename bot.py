@@ -97,13 +97,32 @@ def allowed(update: Update) -> bool:
 
 
 # Which yt-dlp setup to use. /debug tests several and switches to the first that works.
+WARP_PROXY = "socks5h://127.0.0.1:40000"
+
+
+def warp_up() -> bool:
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", 40000), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
 MODES = {
-    "cookies": {"cookies": True, "clients": None},
-    "cookies+tv": {"cookies": True, "clients": "tv,web_safari,mweb"},
-    "nocookies": {"cookies": False, "clients": None},
-    "nocookies+tv": {"cookies": False, "clients": "tv_simply,mweb,web_safari"},
+    "warp+cookies": {"cookies": True, "clients": None, "warp": True},
+    "warp": {"cookies": False, "clients": None, "warp": True},
+    "warp+tv": {"cookies": False, "clients": "tv_simply,mweb,web_safari", "warp": True},
+    "cookies": {"cookies": True, "clients": None, "warp": False},
+    "cookies+tv": {"cookies": True, "clients": "tv,web_safari,mweb", "warp": False},
+    "nocookies": {"cookies": False, "clients": None, "warp": False},
+    "nocookies+tv": {"cookies": False, "clients": "tv_simply,mweb,web_safari", "warp": False},
 }
-MODE = "cookies" if COOKIE_FILE else "nocookies"
+WARP = warp_up()
+if WARP:
+    MODE = "warp+cookies" if COOKIE_FILE else "warp"
+else:
+    MODE = "cookies" if COOKIE_FILE else "nocookies"
 
 
 def base_opts(mode: str | None = None) -> dict:
@@ -113,6 +132,8 @@ def base_opts(mode: str | None = None) -> dict:
         opts["cookiefile"] = str(COOKIE_FILE)
     if os.environ.get("PROXY"):
         opts["proxy"] = os.environ["PROXY"]
+    elif m["warp"]:
+        opts["proxy"] = WARP_PROXY
     if m["clients"]:
         opts["extractor_args"] = {"youtube": {"player_client": m["clients"].split(",")}}
     return opts
@@ -690,7 +711,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ck = "❌ No cookies loaded. YouTube may block downloads."
     deno = shutil.which("deno")
     js = f"✅ JS runtime: deno ({deno})" if deno else "❌ No JS runtime (deno) — YouTube will fail"
-    await update.message.reply_text(f"{ck}\n{js}\nMode: {MODE}\nProxy: {'✅ on' if os.environ.get('PROXY') else 'off'}\n\nyt-dlp version: {yt_dlp.version.__version__}")
+    await update.message.reply_text(f"{ck}\n{js}\nMode: {MODE}\nProxy: {'✅ on' if os.environ.get('PROXY') else 'off'}\nWARP: {'✅ running' if warp_up() else '❌ off'}\n\nyt-dlp version: {yt_dlp.version.__version__}")
 
 
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -702,6 +723,8 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     out, winner = [], None
     for mode in MODES:
         if MODES[mode]["cookies"] and not COOKIE_FILE:
+            continue
+        if MODES[mode]["warp"] and not warp_up():
             continue
         ok, detail = await asyncio.to_thread(try_mode, url, mode)
         out.append(f"{'✅' if ok else '❌'} {mode}: {detail}")
