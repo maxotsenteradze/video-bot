@@ -58,15 +58,17 @@ Open your bot in Telegram, press **Start**, and send a link.
 - **The first message after a break is slow.** Render's free server sleeps after
   15 minutes with no use. Your next message wakes it up, which takes about a minute,
   and then it works normally. Nothing is lost.
-- **YouTube sometimes blocks cloud servers** with "Sign in to confirm you're not a bot".
-  Instagram often needs a login too. To fix that, add cookies:
-  1. On your PC, install the browser extension **"Get cookies.txt LOCALLY"**.
-  2. Log in to YouTube or Instagram, then export cookies.txt with the extension.
-  3. In Render, open your service → **Environment** → **Secret Files** → **Add Secret File**.
-     Filename: `cookies.txt`. Contents: paste the **whole** file. Save.
-     (Pasting it into a `COOKIES` environment variable also works.)
-  4. Send `/status` to the bot to check the cookies were loaded.
-  Use a spare account for this, not your main one.
+- **YouTube blocks cloud servers.** The bot routes downloads through Cloudflare WARP
+  (free, built into the Docker image) and uses your YouTube cookies. Cookies expire every
+  few weeks; when they do, the bot messages you "🍪 YouTube cookies have expired".
+  To update them:
+  1. Open a **private/incognito** window and log in to YouTube (use a spare account).
+  2. Export cookies with **"Get cookies.txt LOCALLY"** (PC) or **Cookie Editor** (iPhone Safari).
+  3. **Close the private window** right away (using it again rotates the cookies).
+  4. **Send the file to the bot** in Telegram. It accepts Netscape .txt or JSON, pins the
+     message, and reloads it after restarts. No Render visit needed.
+  For the auto-reload after restarts, set `ALLOWED_USERS` (or `OWNER_ID`) to your Telegram ID (`/id`).
+  `/status` shows cookies/WARP state; `/debug <link>` tests every setup and picks one that works.
 - **Keep yt-dlp up to date.** Sites change often. If downloads start failing, open
   Render and click **Manual Deploy → Clear build cache & deploy**. This installs the
   newest yt-dlp.

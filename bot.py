@@ -81,10 +81,86 @@ def load_cookies() -> Path | None:
     return dest
 
 
+def to_netscape(text: str) -> str | None:
+    """Accepts Netscape cookies.txt, a JSON export (Cookie Editor etc.) or a table
+    copied from browser DevTools. Returns Netscape text, or None if nothing usable."""
+    import json
+    from datetime import datetime
+    text = text.lstrip("\ufeff").strip()
+    rows = []
+
+    def row(dom, path, secure, exp, name, val):
+        dom = dom or ""
+        rows.append("\t".join([dom, "TRUE" if dom.startswith(".") else "FALSE", path or "/",
+                               "TRUE" if secure else "FALSE", str(int(exp or 0)), name, val]))
+
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        if isinstance(data, dict):
+            data = data.get("cookies", [])
+        for c in data:
+            if not isinstance(c, dict) or "name" not in c:
+                continue
+            dom = c.get("domain", "")
+            if not c.get("hostOnly", False) and dom and not dom.startswith("."):
+                dom = "." + dom
+            row(dom, c.get("path"), c.get("secure"), c.get("expirationDate") or c.get("expires") or 0,
+                c["name"], str(c.get("value", "")))
+    else:
+        for line in text.splitlines():
+            p = line.split("\t")
+            if line.startswith("#") or len(p) < 5:
+                continue
+            if len(p) >= 7 and p[1] in ("TRUE", "FALSE"):  # already Netscape
+                rows.append("\t".join(p[:7]))
+                continue
+            name, val, dom, path, exp = p[:5]  # DevTools table
+            try:
+                ts = datetime.fromisoformat(exp.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = 0
+            row(dom, path, len(p) > 7 and p[7].strip() == "✓", ts, name, val)
+    seen, out = set(), []
+    for r in rows:
+        k = tuple(r.split("\t")[i] for i in (0, 2, 5))
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
+    return "# Netscape HTTP Cookie File\n" + "\n".join(out) + "\n" if out else None
+
+
 COOKIE_FILE = load_cookies()
 COOKIE_LINES = 0
-if COOKIE_FILE:
-    COOKIE_LINES = sum(1 for l in COOKIE_FILE.read_text().splitlines() if l.strip() and not l.startswith("#"))
+COOKIE_SOURCE = "Render secret" if COOKIE_FILE else ""
+COOKIES_BAD = False      # set when YouTube says the cookies were rotated / expired
+COOKIES_WARNED = False   # so we only nag once per cookie set
+OWNER_ID = int(os.environ.get("OWNER_ID") or 0) or (min(ALLOWED_USERS) if ALLOWED_USERS else 0)
+
+
+def count_cookies() -> int:
+    if not COOKIE_FILE:
+        return 0
+    return sum(1 for l in COOKIE_FILE.read_text().splitlines() if l.strip() and not l.startswith("#"))
+
+
+def set_cookies(text: str, source: str) -> int:
+    global COOKIE_FILE, COOKIE_LINES, COOKIE_SOURCE, COOKIES_BAD, COOKIES_WARNED, MODE
+    dest = Path(tempfile.gettempdir()) / "cookies.txt"
+    dest.write_text(text)
+    COOKIE_FILE, COOKIE_SOURCE = dest, source
+    COOKIE_LINES = count_cookies()
+    COOKIES_BAD = COOKIES_WARNED = False
+    if MODE in MODES and not MODES[MODE]["cookies"] and (MODE + "+cookies") in MODES:
+        MODE = MODE + "+cookies"
+    elif MODE == "nocookies":
+        MODE = "cookies"
+    return COOKIE_LINES
+
+
+COOKIE_LINES = count_cookies()
 
 # One download at a time keeps the small free server from running out of RAM.
 download_lock = asyncio.Lock()
@@ -125,9 +201,24 @@ else:
     MODE = "cookies" if COOKIE_FILE else "nocookies"
 
 
+class _CookieWatch:
+    """Quiet yt-dlp logger that notices when YouTube rejects the cookies."""
+    def debug(self, msg):
+        pass
+    info = debug
+    def warning(self, msg):
+        global COOKIES_BAD
+        if "cookies are no longer valid" in msg:
+            COOKIES_BAD = True
+    def error(self, msg):
+        global COOKIES_BAD
+        if COOKIE_FILE and "confirm you" in msg and "not a bot" in msg:
+            COOKIES_BAD = True
+
+
 def base_opts(mode: str | None = None) -> dict:
     m = MODES[mode or MODE]
-    opts = {"noplaylist": True, "quiet": True, "no_warnings": True}
+    opts = {"noplaylist": True, "quiet": True, "no_warnings": True, "logger": _CookieWatch()}
     if COOKIE_FILE and m["cookies"]:
         opts["cookiefile"] = str(COOKIE_FILE)
     if os.environ.get("PROXY"):
@@ -163,6 +254,9 @@ def try_mode(url: str, mode: str) -> tuple[bool, str]:
         n = len(info.get("formats") or [])
         return n > 0, f"{n} formats"
     except Exception as e:
+        global COOKIES_BAD
+        if any("cookies are no longer valid" in l for l in g.lines):
+            COOKIES_BAD = True
         msgs = [l for l in g.lines if "WARNING" in l or "ERROR" in l] or [str(e)]
         return False, "\n".join(m[:250] for m in msgs[-4:])
 
@@ -481,8 +575,9 @@ async def run_playlist(context: ContextTypes.DEFAULT_TYPE, chat_id: int, status,
                 sent += 1
             elif not job["stop"]:
                 skipped.append(f"{i}. {title} ({last_err or 'failed'})")
-                if "sign in" in last_err.lower() and len(skipped) >= 2 and sent == 0:
-                    skipped.append("Stopped early: YouTube is blocking the server. Add/refresh cookies (/status).")
+                low = last_err.lower()
+                if ("sign in" in low or "not a bot" in low or "player response" in low) and len(skipped) >= 2 and sent == 0:
+                    skipped.append("Stopped early: YouTube is blocking the server.")
                     break
     finally:
         awake.set()
@@ -496,6 +591,7 @@ async def run_playlist(context: ContextTypes.DEFAULT_TYPE, chat_id: int, status,
         await status.edit_text(summary)
     except Exception:
         await context.bot.send_message(chat_id, summary)
+    await warn_cookies(context.bot, chat_id)
 
 
 async def on_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -706,9 +802,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if COOKIE_FILE:
         domains = sorted({l.split("\t")[0].lstrip(".") for l in COOKIE_FILE.read_text().splitlines()
                           if l.strip() and not l.startswith("#") and "\t" in l})
-        ck = f"✅ Cookies loaded: {COOKIE_LINES} lines\nSites: {', '.join(domains)[:500] or '?'}"
+        ck = (f"{'❌ Cookies EXPIRED' if COOKIES_BAD else '✅ Cookies loaded'}: {COOKIE_LINES} lines"
+              f" (from {COOKIE_SOURCE})\nSites: {', '.join(domains)[:500] or '?'}")
     else:
-        ck = "❌ No cookies loaded. YouTube may block downloads."
+        ck = "❌ No cookies loaded. Send me a cookies.txt file."
     deno = shutil.which("deno")
     js = f"✅ JS runtime: deno ({deno})" if deno else "❌ No JS runtime (deno) — YouTube will fail"
     await update.message.reply_text(f"{ck}\n{js}\nMode: {MODE}\nProxy: {'✅ on' if os.environ.get('PROXY') else 'off'}\nWARP: {'✅ running' if warp_up() else '❌ off'}\n\nyt-dlp version: {yt_dlp.version.__version__}")
@@ -822,10 +919,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def error_text(e: Exception) -> str:
+    global COOKIES_WARNED
     text = str(e)
     low = text.lower()
-    if "sign in" in low or "login" in low or "cookies" in low:
-        hint = "This site wants a login. Add cookies (see README)."
+    if COOKIES_BAD or ("not a bot" in low and "youtube" in low):
+        hint = COOKIE_HELP
+        COOKIES_WARNED = True
+    elif "sign in" in low or "login" in low or "cookies" in low:
+        hint = "This site wants a login. Send me a fresh cookies.txt file."
     elif "unsupported url" in low:
         hint = "This site isn't supported."
     elif "403" in text:
@@ -835,19 +936,85 @@ def error_text(e: Exception) -> str:
     return f"❌ Couldn't download.\n{hint}\n\n{text[:300]}"
 
 
+COOKIE_HELP = ("🍪 YouTube cookies have expired.\n"
+               "Export fresh ones (private/incognito window, then close it) "
+               "and just send the cookies.txt file here.")
+
+
+async def warn_cookies(bot, chat_id: int) -> None:
+    """Tell the user once that the cookies died."""
+    global COOKIES_WARNED
+    if COOKIES_BAD and not COOKIES_WARNED:
+        COOKIES_WARNED = True
+        try:
+            await bot.send_message(chat_id, COOKIE_HELP)
+        except Exception as e:
+            log.warning("cookie warning failed: %s", e)
+
+
+async def on_cookie_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User sends a cookies file (or JSON export) as a document."""
+    if not allowed(update):
+        return
+    doc = update.message.document
+    if doc.file_size and doc.file_size > 2_000_000:
+        await update.message.reply_text("File too big for a cookies file.")
+        return
+    raw = await (await doc.get_file()).download_as_bytearray()
+    text = to_netscape(bytes(raw).decode("utf-8", errors="ignore"))
+    if not text:
+        await update.message.reply_text("❌ That doesn't look like a cookies file (Netscape .txt or JSON).")
+        return
+    names = {l.split("\t")[5] for l in text.splitlines() if l.count("\t") >= 6}
+    n = set_cookies(text, "Telegram")
+    key = {"SID", "HSID", "SSID", "__Secure-3PSID", "LOGIN_INFO"}
+    missing = sorted(key - names)
+    # Pin it so the bot can reload it after a restart.
+    try:
+        await update.message.pin(disable_notification=True)
+        saved = "📌 Pinned — I'll reload it automatically after restarts."
+    except Exception as e:
+        log.warning("pin failed: %s", e)
+        saved = "⚠️ Couldn't pin it; after a restart send it again."
+    if OWNER_ID and update.effective_chat.id != OWNER_ID:
+        saved = "⚠️ Not your owner chat; after a restart send it again."
+    msg = f"✅ Cookies updated: {n} lines\n{saved}"
+    if missing:
+        msg += f"\n\n⚠️ Missing important YouTube cookies: {', '.join(missing)}. YouTube may still block."
+    await update.message.reply_text(msg)
+
+
+async def restore_cookies(app) -> None:
+    """On startup: load the cookies file pinned in the owner's chat, if any."""
+    if not OWNER_ID:
+        return
+    try:
+        chat = await app.bot.get_chat(OWNER_ID)
+        pin = chat.pinned_message
+        if pin and pin.document:
+            raw = await (await app.bot.get_file(pin.document.file_id)).download_as_bytearray()
+            text = to_netscape(bytes(raw).decode("utf-8", errors="ignore"))
+            if text:
+                n = set_cookies(text, "Telegram (pinned)")
+                log.info("Restored %s cookie lines from pinned message", n)
+    except Exception as e:
+        log.warning("Cookie restore failed: %s", e)
+
+
 async def mp3_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Old shortcut still works: /mp3 <link> just shows the menu.
     await on_link(update, context)
 
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).post_init(restore_cookies).build()
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("id", myid))
     app.add_handler(CommandHandler("mp3", mp3_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_cookie_file))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(on_one, pattern=r"^one\|"))
     app.add_handler(CallbackQueryHandler(on_playlist, pattern=r"^pl\|"))
