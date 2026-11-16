@@ -450,6 +450,7 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         await msg.reply_text(f"Not allowed. Your ID: {update.effective_user.id}")
         return
+    log.info("Text message (%s chars), cookies-like=%s", len(msg.text or ""), looks_like_cookies(msg.text or ""))
     if await on_cookie_text(update, context):
         return
     m = URL_RE.search(msg.text or "")
@@ -1032,6 +1033,17 @@ async def on_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return True
 
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show any crash in the chat instead of failing silently."""
+    log.exception("Handler error", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                update.effective_chat.id, f"⚠️ Bot error: {type(context.error).__name__}: {str(context.error)[:500]}")
+    except Exception:
+        pass
+
+
 async def restore_cookies(app) -> None:
     """On startup: load the cookies file pinned in the owner's chat, if any."""
     if not OWNER_ID:
@@ -1063,6 +1075,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, on_cookie_file))
+    app.add_error_handler(on_error)
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(on_one, pattern=r"^one\|"))
     app.add_handler(CallbackQueryHandler(on_playlist, pattern=r"^pl\|"))
