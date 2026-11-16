@@ -95,11 +95,52 @@ def allowed(update: Update) -> bool:
     )
 
 
-def base_opts() -> dict:
+# Which yt-dlp setup to use. /debug tests several and switches to the first that works.
+MODES = {
+    "cookies": {"cookies": True, "clients": None},
+    "cookies+tv": {"cookies": True, "clients": "tv,web_safari,mweb"},
+    "nocookies": {"cookies": False, "clients": None},
+    "nocookies+tv": {"cookies": False, "clients": "tv_simply,mweb,web_safari"},
+}
+MODE = "cookies" if COOKIE_FILE else "nocookies"
+
+
+def base_opts(mode: str | None = None) -> dict:
+    m = MODES[mode or MODE]
     opts = {"noplaylist": True, "quiet": True, "no_warnings": True}
-    if COOKIE_FILE:
+    if COOKIE_FILE and m["cookies"]:
         opts["cookiefile"] = str(COOKIE_FILE)
+    if m["clients"]:
+        opts["extractor_args"] = {"youtube": {"player_client": m["clients"].split(",")}}
     return opts
+
+
+class _Grab:
+    """Collects yt-dlp log lines for /debug."""
+    def __init__(self):
+        self.lines = []
+    def debug(self, msg):
+        if msg.startswith("[debug] ") and "Invoking" not in msg:
+            return
+        self.lines.append(msg)
+    info = debug
+    def warning(self, msg):
+        self.lines.append("WARNING: " + msg)
+    def error(self, msg):
+        self.lines.append(msg)
+
+
+def try_mode(url: str, mode: str) -> tuple[bool, str]:
+    g = _Grab()
+    opts = base_opts(mode) | {"logger": g, "quiet": False, "no_warnings": False, "skip_download": True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        n = len(info.get("formats") or [])
+        return n > 0, f"{n} formats"
+    except Exception as e:
+        msgs = [l for l in g.lines if "WARNING" in l or "ERROR" in l] or [str(e)]
+        return False, "\n".join(m[:250] for m in msgs[-4:])
 
 
 # ---------- yt-dlp helpers (run in a thread) ----------
@@ -646,7 +687,29 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ck = "❌ No cookies loaded. YouTube may block downloads."
     deno = shutil.which("deno")
     js = f"✅ JS runtime: deno ({deno})" if deno else "❌ No JS runtime (deno) — YouTube will fail"
-    await update.message.reply_text(f"{ck}\n{js}\n\nyt-dlp version: {yt_dlp.version.__version__}")
+    await update.message.reply_text(f"{ck}\n{js}\nMode: {MODE}\n\nyt-dlp version: {yt_dlp.version.__version__}")
+
+
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global MODE
+    if not allowed(update):
+        return
+    url = context.args[0] if context.args else "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    msg = await update.message.reply_text("🔎 Testing YouTube access…")
+    out, winner = [], None
+    for mode in MODES:
+        if MODES[mode]["cookies"] and not COOKIE_FILE:
+            continue
+        ok, detail = await asyncio.to_thread(try_mode, url, mode)
+        out.append(f"{'✅' if ok else '❌'} {mode}: {detail}")
+        if ok and not winner:
+            winner = mode
+    if winner:
+        MODE = winner
+        out.append(f"\n➡️ Now using: {winner} (until restart)")
+    else:
+        out.append("\n⛔ All failed — YouTube is blocking this server.")
+    await msg.edit_text("\n\n".join(out)[:4000])
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -758,6 +821,7 @@ def main() -> None:
     app.add_handler(CommandHandler("mp3", mp3_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(on_one, pattern=r"^one\|"))
     app.add_handler(CallbackQueryHandler(on_playlist, pattern=r"^pl\|"))
