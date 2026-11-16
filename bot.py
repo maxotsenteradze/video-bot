@@ -94,7 +94,15 @@ def to_netscape(text: str) -> str | None:
         rows.append("\t".join([dom, "TRUE" if dom.startswith(".") else "FALSE", path or "/",
                                "TRUE" if secure else "FALSE", str(int(exp or 0)), name, val]))
 
-    if text.startswith("[") or text.startswith("{"):
+    hdr = re.sub(r"^(cookie:\s*)", "", text, flags=re.I).strip()
+    if "\t" not in hdr and "\n" not in hdr and "=" in hdr and ";" in hdr and not hdr.startswith(("[", "{")):
+        # "Cookie:" request header copied from a network-capture app (Stream, HTTP Catcher...)
+        for part in hdr.split(";"):
+            if "=" in part:
+                name, val = part.strip().split("=", 1)
+                if name:
+                    row(".youtube.com", "/", True, 0, name, val)
+    elif text.startswith("[") or text.startswith("{"):
         try:
             data = json.loads(text)
         except ValueError:
@@ -997,7 +1005,8 @@ async def warn_cookies(bot, chat_id: int) -> None:
 
 def looks_like_cookies(text: str) -> bool:
     t = text.lstrip()
-    return (t.startswith("# Netscape") or t.startswith("# HTTP Cookie")
+    return (t.lower().startswith("cookie:") or ("SAPISID=" in t and ";" in t)
+            or t.startswith("# Netscape") or t.startswith("# HTTP Cookie")
             or (t.startswith("[") and '"name"' in t)
             or bool(re.search(r"\.(youtube|google)\.com\s+(TRUE|FALSE)\s", t)))
 
