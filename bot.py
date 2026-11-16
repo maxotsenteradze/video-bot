@@ -10,6 +10,7 @@ Environment variables:
   ALLOWED_USERS   - comma-separated Telegram user IDs allowed to use the bot
                     (optional but strongly recommended; empty = anyone)
   COOKIES         - optional: contents of a cookies.txt file (Netscape format)
+  PROXY           - optional: proxy for yt-dlp, e.g. http://user:pass@host:port or socks5://host:port
                     for sites that need login (Instagram, some YouTube videos)
   WEBHOOK_URL     - public URL of the service. On Render this is detected
                     automatically from RENDER_EXTERNAL_URL.
@@ -110,6 +111,8 @@ def base_opts(mode: str | None = None) -> dict:
     opts = {"noplaylist": True, "quiet": True, "no_warnings": True}
     if COOKIE_FILE and m["cookies"]:
         opts["cookiefile"] = str(COOKIE_FILE)
+    if os.environ.get("PROXY"):
+        opts["proxy"] = os.environ["PROXY"]
     if m["clients"]:
         opts["extractor_args"] = {"youtube": {"player_client": m["clients"].split(",")}}
     return opts
@@ -687,7 +690,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ck = "❌ No cookies loaded. YouTube may block downloads."
     deno = shutil.which("deno")
     js = f"✅ JS runtime: deno ({deno})" if deno else "❌ No JS runtime (deno) — YouTube will fail"
-    await update.message.reply_text(f"{ck}\n{js}\nMode: {MODE}\n\nyt-dlp version: {yt_dlp.version.__version__}")
+    await update.message.reply_text(f"{ck}\n{js}\nMode: {MODE}\nProxy: {'✅ on' if os.environ.get('PROXY') else 'off'}\n\nyt-dlp version: {yt_dlp.version.__version__}")
 
 
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
