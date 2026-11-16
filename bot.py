@@ -19,6 +19,7 @@ Without WEBHOOK_URL / RENDER_EXTERNAL_URL the bot runs in polling mode,
 so you can also just run `python bot.py` on your own PC.
 """
 
+import shutil
 import asyncio
 import logging
 import os
@@ -388,7 +389,7 @@ async def run_playlist(context: ContextTypes.DEFAULT_TYPE, chat_id: int, status,
                             else:
                                 path = await asyncio.to_thread(download_quality, e["url"], folder, step)
                         except Exception as err:
-                            last_err = str(err)[:120]
+                            last_err = str(err).replace("please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U", "").strip()[:200]
                             log.warning("Playlist item failed %s: %s", e["url"], err)
                             break  # a download error won't be fixed by lower quality
                         if path.stat().st_size > MAX_BYTES:
@@ -643,7 +644,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ck = f"✅ Cookies loaded: {COOKIE_LINES} lines\nSites: {', '.join(domains)[:500] or '?'}"
     else:
         ck = "❌ No cookies loaded. YouTube may block downloads."
-    await update.message.reply_text(f"{ck}\n\nyt-dlp version: {yt_dlp.version.__version__}")
+    deno = shutil.which("deno")
+    js = f"✅ JS runtime: deno ({deno})" if deno else "❌ No JS runtime (deno) — YouTube will fail"
+    await update.message.reply_text(f"{ck}\n{js}\n\nyt-dlp version: {yt_dlp.version.__version__}")
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
