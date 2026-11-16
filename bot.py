@@ -234,9 +234,14 @@ class _CookieWatch:
 
 def base_opts(mode: str | None = None) -> dict:
     global MODE, WARP
-    if mode is None and not WARP and warp_up():
-        WARP = True
-        MODE = "warp+cookies" if COOKIE_FILE else "warp"
+    if mode is None:
+        up = warp_up()
+        if up != WARP or MODES[MODE]["warp"] != up:
+            WARP = up
+            if up:
+                MODE = "warp+cookies" if COOKIE_FILE else "warp"
+            else:
+                MODE = "cookies" if COOKIE_FILE else "nocookies"
     m = MODES[mode or MODE]
     opts = {"noplaylist": True, "quiet": True, "no_warnings": True, "logger": _CookieWatch()}
     if COOKIE_FILE and m["cookies"]:
@@ -831,7 +836,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ck = "❌ No cookies loaded. Send me a cookies.txt file."
     deno = shutil.which("deno")
     js = f"✅ JS runtime: deno ({deno})" if deno else "❌ No JS runtime (deno) — YouTube will fail"
-    await update.message.reply_text(f"{ck}\n{js}\nMode: {MODE}\nProxy: {'✅ on' if os.environ.get('PROXY') else 'off'}\nWARP: {'✅ running' if warp_up() else '❌ off'}\n\nyt-dlp version: {yt_dlp.version.__version__}")
+    await update.message.reply_text(f"{ck}\n{js}\nMode: {MODE}\nProxy: {'✅ on' if os.environ.get('PROXY') else 'off'}\nWARP: {'✅ running' if warp_up() else '❌ off (retrying in background)'}{' · saved' if Path('/etc/secrets/warp.conf').is_file() else ''}\n\nyt-dlp version: {yt_dlp.version.__version__}")
 
 
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -856,6 +861,21 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         out.append("\n⛔ All failed — YouTube is blocking this server.")
     await msg.edit_text("\n\n".join(out)[:4000])
+
+
+async def warpconf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the current WARP config so it can be saved as a Render Secret File."""
+    import io
+    if not allowed(update):
+        return
+    p = Path("/tmp/warp/wp.conf")
+    if not p.is_file():
+        await update.message.reply_text("WARP isn't set up yet. Try again in a few minutes.")
+        return
+    await update.message.reply_document(
+        io.BytesIO(p.read_bytes()), filename="warp.conf",
+        caption="Render → Environment → Secret Files → Add: filename warp.conf, paste this file's text. "
+                "Then WARP won't need to re-register after restarts.")
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1074,6 +1094,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
+    app.add_handler(CommandHandler("warpconf", warpconf_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, on_cookie_file))
     app.add_error_handler(on_error)
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^dl\|"))
